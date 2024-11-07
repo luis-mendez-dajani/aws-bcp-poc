@@ -47,3 +47,11 @@ The user call flow consists of the following steps:
 9. When relevant context is identified, the application forwards this information—both the user’s query and the retrieved context—to the LLM module.
 10. The LLM module processes the provided query and context to generate a response.
 11. The application delivers the generated response back to the user through its GUI. This completes the loop of interaction, where the user’s initial query results in a comprehensive and contextually relevant response derived from the uploaded documents and the application’s knowledge base.
+
+In the following sections, we walk through the steps to create an S3 bucket and knowledge base, deploy the Streamlit application with [AWS CloudFormation](CFT-streamlt-app.yaml), and test the solution.
+
+## Testing
+
+For testing purposes, it was uploaded 10 BCP files 2024-2025 Fiscal Year for DMV.
+
+- Can you provide a table with the "BCP Fiscal Detail Sheet" for BCP 2740-036-BCP-2024
