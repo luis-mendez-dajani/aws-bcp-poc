@@ -1,0 +1,571 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template for provisioning an Open search collectin, bedrock knowledgebase, IAM roleas and EC2 instance with streamlit app deployment
+Metadata: 
+  AWS::CloudFormation::Interface: 
+    ParameterGroups:
+      - 
+        Label: 
+          default: "KnowledgeBase Configuration"
+        Parameters: 
+          - KnowledgeBasedID    
+          - DatasourceID
+      - 
+        Label: 
+          default: "S3Bucket Configuration"
+        Parameters: 
+          - RAGDocumentInput             
+      - 
+        Label: 
+          default: "Network Configuration"
+        Parameters: 
+          - VpcId
+          - SubnetId
+          - YourPublicIP
+      - 
+        Label: 
+          default: "Amazon EC2 Configuration"
+        Parameters: 
+          - InstanceType
+          - LatestLinuxAMI         
+Parameters:
+  InstanceType:
+    Description: The EC2 instance type.
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro, t2.small, t2.medium]
+  LatestLinuxAMI:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Description: Amazon Linux Image ID. 
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+  YourPublicIP:
+    Type: String
+    Description: Provide your Public IP address in CIDR notation (e.g., 1.2.3.4/32) from where you access the Streamlit app
+  KnowledgeBasedID:
+    Type: String
+    Description: Provide the ID of your knowledge base.
+  DatasourceID:
+    Type: String
+    Description: Provide the ID of your Data Source.  
+  RAGDocumentInput:
+    Type: String
+    Description: Provide the S3 Bucket name.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC this server will reside in   
+  SubnetId:
+    Type: "AWS::EC2::Subnet::Id"
+    Description: Subnet ID your instance will launch in. Should be Internet accessible for the purposes of this demo.    
+Resources:
+  PermissionForS3BucketToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !GetAtt KBSync.Arn 
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId      
+      SourceArn:  
+          !Sub "arn:aws:s3:::${RAGDocumentInput}"         
+
+  LambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketNotification'
+                  - 's3:PutBucketNotification'
+                Resource: !Sub 'arn:aws:s3:::${RAGDocumentInput}'
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/customresource-lambda-functions:* 
+
+  CustomResourceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaIAMRole.Arn
+      Code:
+        ZipFile: |
+
+            from __future__ import print_function
+            import json
+            import boto3
+            import cfnresponse
+            
+            SUCCESS = "SUCCESS"
+            FAILED = "FAILED"
+            
+            print('Loading function')
+            s3 = boto3.resource('s3')
+            
+            def lambda_handler(event, context):
+                print("Received event: " + json.dumps(event, indent=2))
+                responseData={}
+                try:
+                    if event['RequestType'] == 'Delete':
+                        print("Request Type:",event['RequestType'])
+                        Bucket=event['ResourceProperties']['Bucket']
+                        delete_notification(Bucket)
+                        print("Sending response to custom resource after Delete")
+                    elif event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        print("Request Type:",event['RequestType'])
+                        LambdaArn=event['ResourceProperties']['LambdaArn']
+                        Bucket=event['ResourceProperties']['Bucket']
+                        add_notification(LambdaArn, Bucket)
+                        responseData={'Bucket':Bucket}
+                        print("Sending response to custom resource")
+                    responseStatus = 'SUCCESS'
+                except Exception as e:
+                    print('Failed to process:', e)
+                    responseStatus = 'FAILED'
+                    responseData = {'Failure': 'Something bad happened.'}
+                cfnresponse.send(event, context, responseStatus, responseData, "CustomResourcePhysicalID")
+
+            def add_notification(LambdaArn, Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                  NotificationConfiguration={
+                    'LambdaFunctionConfigurations': [
+                      {
+                          'LambdaFunctionArn': LambdaArn,
+                          'Events': [
+                              's3:ObjectCreated:*'
+                          ]
+                      }
+                    ]
+                  }
+                )
+                print("Put request completed....")
+              
+            def delete_notification(Bucket):
+                bucket_notification = s3.BucketNotification(Bucket)
+                response = bucket_notification.put(
+                    NotificationConfiguration={}
+                )
+                print("Delete request completed....")
+      Runtime: python3.12
+      Timeout: 50
+
+  LambdaTrigger:
+    Type: 'Custom::LambdaTrigger'
+    DependsOn: PermissionForS3BucketToInvokeLambda
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      LambdaArn: !GetAtt KBSync.Arn
+      Bucket: !Ref RAGDocumentInput
+      
+  KBSyncRole:
+    Type: AWS::IAM::Role      
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: KBSyncLambdaFunctionAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:         
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            - s3:ListBucket
+            - s3:PutObject
+            Resource:
+            - !Sub arn:aws:s3:::rag-demo-input-${AWS::AccountId}
+            - !Sub arn:aws:s3:::rag-demo-input-${AWS::AccountId}/* 
+          - Effect: Allow
+            Action:
+            - bedrock:StartIngestionJob
+            - bedrock:ListIngestionJobs
+            Resource: !Sub
+                - "arn:aws:bedrock:${region}:${account}:knowledge-base/${kbid}"
+                - region: !Ref 'AWS::Region'
+                  account: !Ref 'AWS::AccountId'
+                  kbid: !Ref KnowledgeBasedID        
+          - Effect: Allow
+            Action: logs:CreateLogGroup
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action:
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/kbsync-demo-functions:* 
+            
+  KBSync:
+    Type: AWS::Lambda::Function
+    Metadata:
+        cfn_nag:
+            rules_to_suppress:
+            - id: W92
+              reason: "Customer will enable reservedconcurrentlimit based on their use case"
+            - id: W58
+              reason: "Lambda functions has permissions to write cloudwatch logs"                
+    Properties:
+      FunctionName: kbsync-demo-functions
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Runtime: python3.12
+      Role: !GetAtt KBSyncRole.Arn
+      Code:
+        ZipFile: |      
+            import os
+            import json
+            import boto3
+            bedrockClient = boto3.client('bedrock-agent')
+            def lambda_handler(event, context):
+                dataSourceId = os.environ['DATASOURCEID']
+                knowledgeBaseId = os.environ['KNOWLEDGEBASEID']
+                # Check for in-progress ingestion jobs
+                try:
+                    list_response = bedrockClient.list_ingestion_jobs(
+                        dataSourceId=dataSourceId,
+                        knowledgeBaseId=knowledgeBaseId,
+                        filters=[
+                            {
+                                'attribute': 'STATUS',
+                                'operator': 'EQ',
+                                'values': ['IN_PROGRESS']
+                            }
+                        ]
+                    )
+                    # Check if the ingestionJobSummaries list is empty
+                    if list_response.get('ingestionJobSummaries'):
+                        print('There are ingestion jobs currently in progress.')
+                        return {
+                            'statusCode': 200,
+                            'body': json.dumps('Ingestion job already in progress.')
+                        }
+                except Exception as e:
+                    print('Error checking ingestion jobs: ', str(e))
+                    return {
+                        'statusCode': 500,
+                        'body': json.dumps('Error checking ingestion jobs: ' + str(e))
+                    }
+                # Start a new ingestion job if no jobs are in progress
+                try:
+                    response = bedrockClient.start_ingestion_job(
+                        knowledgeBaseId=knowledgeBaseId,
+                        dataSourceId=dataSourceId
+                    )
+                    print('Ingestion Job Response: ', response)
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps('Ingestion job started successfully.')
+                    }
+                except Exception as e:
+                    print('Error starting ingestion job: ', str(e))
+                    return {
+                        'statusCode': 500,
+                        'body': json.dumps('Error starting ingestion job: ' + str(e))
+                    }
+      Environment:
+        Variables:
+          KNOWLEDGEBASEID: !Ref KnowledgeBasedID
+          DATASOURCEID: !Ref DatasourceID
+  EC2InstanceRole:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Path: /
+      Roles: 
+       - !Ref S3AccessRole
+
+  S3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore              
+  S3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: S3Policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+            - "s3:ListBucket"
+            Resource: 
+            - !Sub "arn:aws:s3:::${RAGDocumentInput}"
+          - Effect: Allow
+            Action:
+            - "s3:PutObject"
+            - "s3:GetObject"
+            - "s3:DeleteObject"
+            Resource: 
+            - !Sub "arn:aws:s3:::${RAGDocumentInput}/*"
+      Roles:
+      - !Ref S3AccessRole 
+  BedrockPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: BedrockPolicy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:RetrieveAndGenerate
+                - bedrock:Retrieve
+              Resource: !Sub
+                - "arn:aws:bedrock:${region}:${account}:knowledge-base/${kbid}"
+                - region: !Ref 'AWS::Region'
+                  account: !Ref 'AWS::AccountId'
+                  kbid: !Ref KnowledgeBasedID
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: !Sub
+                - "arn:aws:bedrock:${region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+                - region: !Ref 'AWS::Region'
+                  account: !Ref 'AWS::AccountId'               
+      Roles:
+      - !Ref S3AccessRole      
+  EC2SecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Metadata:
+        cfn_nag:
+            rules_to_suppress:
+            - id: W5
+              reason: "Security Group Egree is needed to download the required libraries"       
+      Properties:
+        GroupDescription: "Security group for EC2 instance to access streamlit app"
+        VpcId: !Ref VpcId
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 8501
+            ToPort: 8501
+            CidrIp: !Ref YourPublicIP
+            Description: "Port to access the streamlit app from the browser"
+          - IpProtocol: tcp
+            FromPort: 8502
+            ToPort: 8502
+            CidrIp: !Ref YourPublicIP 
+            Description: "Port to access the streamlit app from the browser"
+        SecurityGroupEgress:
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: '0.0.0.0/0'
+            Description: "Port for streamlit app to download libraries"            
+
+  WebServerHost:
+        Type: AWS::EC2::Instance
+        DependsOn: RagDemoEIP
+        Metadata:
+            Comment: Install a stremlit application
+            AWS::CloudFormation::Init:
+                config:
+                  packages:
+                    yum:
+                      python3: []
+                  groups:
+                    root: {}
+                  users:
+                    "root":
+                      groups:
+                        - "wheel"                             
+                  files:
+                      /home/ec2-user/streamlit_code/app.py:
+                        content: !Sub |
+                          import streamlit as st
+                          import boto3
+                          import os
+                          from QandA import letschat
+                          import json
+                          s3 = boto3.client('s3')
+                          bucket_name="${RAGDocumentInput}"
+                          def upload_to_s3(file, bucket_name):
+                              try:
+                                  object_name = os.path.basename(file.name)
+                                  s3.upload_fileobj(file, bucket_name, object_name)
+                                  st.success(f"File '{object_name}' successfully uploaded ")
+                                  return
+                              except Exception as e:
+                                  st.error(f"Error uploading file: {e}")
+                          def get_file():
+                              uploaded_files = st.file_uploader("Choose files or drag them here", type=["txt", "pdf", "jpg", "png"], accept_multiple_files=True)
+                              if uploaded_files is not None:
+                                  for uploaded_file in uploaded_files:
+                                      upload_to_s3(uploaded_file, bucket_name)
+                          if __name__ == "__main__":
+                              get_file()
+                              letschat()
+                        mode: '000644'
+                        owner: root
+                        group: root                      
+                      /home/ec2-user/streamlit_code/QandA.py:
+                        content: !Sub |
+                              import boto3
+                              import streamlit as st
+                              from langchain_community.retrievers import AmazonKnowledgeBasesRetriever
+                              import json
+                              if 'chat_history' not in st.session_state:
+                                  st.session_state.chat_history = []
+                              for message in st.session_state.chat_history:
+                                  with st.chat_message(message['role']):
+                                      st.markdown(message['text'])
+                              bedrockClient = boto3.client('bedrock-agent-runtime', '${AWS::Region}')
+                              knowledge_base_id="${KnowledgeBasedID}"
+                              def getAnswers(questions):
+                                  knowledgeBaseResponse = bedrockClient.retrieve_and_generate(
+                                      input={'text': questions},
+                                      retrieveAndGenerateConfiguration={
+                                          'knowledgeBaseConfiguration': {
+                                              'knowledgeBaseId': knowledge_base_id,
+                                              'modelArn': 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0',
+                                              'retrievalConfiguration': {
+                                                      'vectorSearchConfiguration': {
+                                                          'numberOfResults': 100,
+                                                          'overrideSearchType': 'HYBRID'
+                                                      }
+                                                  }
+                                          },
+                                          'type': 'KNOWLEDGE_BASE'
+                                      })
+                                  return knowledgeBaseResponse
+                              def getreply(query):
+                                  response = bedrockClient.retrieve(
+                                  knowledgeBaseId=knowledge_base_id,
+                                  retrievalQuery={'query':query},
+                                  retrievalConfiguration={
+                                              'vectorSearchConfiguration': {
+                                                  'numberOfResults': 2
+                                              }
+                                          },
+                                          nextToken='loan'
+                                  )
+                                  return response
+                              def open_sidebar():
+                                  st.session_state.sidebar = True
+                              def letschat():
+                                  if 'chat_history' not in st.session_state:
+                                      st.session_state.chat_history = []
+                                  for message in st.session_state.chat_history:
+                                      with st.chat_message(message['role']):
+                                          st.markdown(message['text'])
+                                  message_placeholder = st.empty()
+                                  questions = st.chat_input('Enter you questions here...')
+                                  if questions:
+                                      with st.chat_message('user'):
+                                          st.markdown(questions)
+                                      st.session_state.chat_history.append({"role":'user', "text":questions})
+                                      with st.spinner("Thinking..."):
+                                       query=json.dumps(questions)
+                                       response = getAnswers(questions)
+                                      answer = response['output']['text']
+                                      with st.chat_message('assistant'):
+                                          with st.spinner("Thinking..."):
+                                              st.markdown(answer)
+                                      st.session_state.chat_history.append({"role":'assistant', "text": answer})
+                                      with st.container():
+                                          st.write("&nbsp;")
+                                      if len(response['citations'][0]['retrievedReferences']) != 0:
+                                          context = response['citations'][0]['retrievedReferences'][0]['content']['text']
+                                          doc_url = response['citations'][0]['retrievedReferences'][0]['location']['s3Location']['uri']
+                                          st.markdown(f"<span style='color:#FFDA33'>Context used: </span>{context}", unsafe_allow_html=True)
+                                          st.markdown(f"<span style='color:#FFDA33'>Source Document: </span>{doc_url}", unsafe_allow_html=True)
+                                      else:
+
+                                           st.markdown(f"<span style='color:red'>No Context</span>", unsafe_allow_html=True)
+                        mode: '000644'
+                        owner: root
+                        group: root                                         
+                      /home/ec2-user/streamlit_code/python_libraries_run_app.sh:
+                        content: |
+                                  cd /home/ec2-user/streamlit_code/
+                                  sudo yum install pip -y
+                                  pip3 install --ignore-installed boto3==1.34.75
+                                  pip3 install --ignore-installed send-mail
+                                  pip3 install --ignore-installed streamlit
+                                  pip3 install --ignore-installed secure-smtplmpt
+                                  pip3 install --ignore-installed langchain_community
+                                  nohup python3 -m streamlit run app.py &   
+                        mode: '000777'
+                        owner: root
+                        group: root                                                      
+        
+        Properties:
+          InstanceType: !Ref InstanceType
+          ImageId: !Ref LatestLinuxAMI
+          IamInstanceProfile: !Ref EC2InstanceRole
+          NetworkInterfaces:
+            - NetworkInterfaceId: !Ref RagDemoNetworkInterface
+              DeviceIndex: 0            
+          UserData:
+            "Fn::Base64":
+              !Sub |
+                #!/bin/bash -xe
+                # Get the latest CloudFormation package
+                yum update -y aws-cfn-bootstrap
+                # Start cfn-init
+                sudo  /opt/aws/bin/cfn-init -s ${AWS::StackId} -r WebServerHost --region ${AWS::Region} || error_exit 'Failed to run cfn-init'
+                # Install Python Packages and run the application 
+                /home/ec2-user/streamlit_code/python_libraries_run_app.sh
+                # All done so signal success
+                sudo  /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource WebServerHost --region ${AWS::Region}                    
+        CreationPolicy:
+          ResourceSignal:
+            Timeout: PT4M
+  RagDemoEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: !Ref VpcId
+
+  RagDemoEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt RagDemoEIP.AllocationId
+      NetworkInterfaceId: !Ref RagDemoNetworkInterface
+
+  RagDemoNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref SubnetId
+      Description: Interface for Streamlit app Connection
+      GroupSet:
+      - !Ref EC2SecurityGroup
+      SourceDestCheck: true            
+Outputs:
+  InstanceId:
+    Description: The ID of the EC2 instance.
+    Value: !Ref WebServerHost
+  StreamlitURL: 
+    Description: HTTP Endpoint for Streamlit application
+    Value:  !Join ["", [ "http://", !GetAtt WebServerHost.PublicDnsName,  ":8501"  ]]    
